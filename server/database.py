@@ -13,11 +13,94 @@ if IS_POSTGRES:
     import psycopg2
     from psycopg2.extras import RealDictCursor
 
+    class PostgresCursorWrapper:
+        def __init__(self, cursor):
+            self._cursor = cursor
+            self._lastrowid = None
+
+        def execute(self, query: str, vars=None):
+            clean_query = query.strip()
+            if '?' in clean_query:
+                clean_query = clean_query.replace('?', '%s')
+
+            is_insert = clean_query.upper().startswith("INSERT INTO")
+            has_returning = "RETURNING" in clean_query.upper()
+            is_settings = "INSERT INTO SETTINGS" in clean_query.upper()
+
+            if is_insert and not has_returning and not is_settings:
+                clean_query += " RETURNING id"
+                if vars is not None:
+                    res = self._cursor.execute(clean_query, vars)
+                else:
+                    res = self._cursor.execute(clean_query)
+                try:
+                    row = self._cursor.fetchone()
+                    if row:
+                        self._lastrowid = row.get("id") if isinstance(row, dict) else row[0]
+                except Exception:
+                    self._lastrowid = None
+                return res
+
+            if vars is not None:
+                return self._cursor.execute(clean_query, vars)
+            else:
+                return self._cursor.execute(clean_query)
+
+        def executemany(self, query: str, vars_list=None):
+            clean_query = query.strip()
+            if '?' in clean_query:
+                clean_query = clean_query.replace('?', '%s')
+            if vars_list is not None:
+                return self._cursor.executemany(clean_query, vars_list)
+            return self._cursor.executemany(clean_query)
+
+        def fetchone(self):
+            return self._cursor.fetchone()
+
+        def fetchall(self):
+            return self._cursor.fetchall()
+
+        def fetchmany(self, size=None):
+            return self._cursor.fetchmany(size) if size else self._cursor.fetchmany()
+
+        @property
+        def lastrowid(self):
+            return self._lastrowid
+
+        def __getattr__(self, name):
+            return getattr(self._cursor, name)
+
+    class PostgresConnWrapper:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def cursor(self, *args, **kwargs):
+            c = self._conn.cursor(*args, **kwargs)
+            return PostgresCursorWrapper(c)
+
+        def commit(self):
+            return self._conn.commit()
+
+        def rollback(self):
+            return self._conn.rollback()
+
+        def close(self):
+            return self._conn.close()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return self._conn.__exit__(exc_type, exc_val, exc_tb)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
 def get_db():
     if IS_POSTGRES:
         pg_url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-        conn = psycopg2.connect(pg_url, cursor_factory=RealDictCursor)
-        return conn
+        raw_conn = psycopg2.connect(pg_url, cursor_factory=RealDictCursor)
+        return PostgresConnWrapper(raw_conn)
     else:
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
         conn = sqlite3.connect(DB_PATH, timeout=30)

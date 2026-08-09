@@ -436,10 +436,12 @@ def update_campaign(campaign_id: int, campaign: CampaignCreate, user: dict = Dep
               campaign.attachment_filename, campaign.attachment_path, campaign_id, u_id))
 
     # Sync contacts: remove old pending contacts, keep sent ones, add newly selected ones
-    cursor.execute("DELETE FROM campaign_contacts WHERE campaign_id = ? AND status = 'pending'", (campaign_id,))
-    
-    # Fetch remaining contact_ids
-    cursor.execute("SELECT contact_id FROM campaign_contacts WHERE campaign_id = ?", (campaign_id,))
+    if IS_POSTGRES:
+        cursor.execute("DELETE FROM campaign_contacts WHERE campaign_id = %s AND status = 'pending'", (campaign_id,))
+        cursor.execute("SELECT contact_id FROM campaign_contacts WHERE campaign_id = %s", (campaign_id,))
+    else:
+        cursor.execute("DELETE FROM campaign_contacts WHERE campaign_id = ? AND status = 'pending'", (campaign_id,))
+        cursor.execute("SELECT contact_id FROM campaign_contacts WHERE campaign_id = ?", (campaign_id,))
     existing_contacts = {r[0] if not isinstance(r, dict) else r["contact_id"] for r in cursor.fetchall()}
 
     for contact_id in campaign.contact_ids:
@@ -469,24 +471,44 @@ def get_email_queue(campaign_id: Optional[int] = None, status: Optional[str] = N
     conn = get_db()
     cursor = conn.cursor()
 
-    query = """
-        SELECT cc.id as cc_id, cc.status as send_status, cc.scheduled_time, cc.sent_at, cc.opened_at, cc.open_count, cc.error_message,
-               c.id as campaign_id, c.name as campaign_name, c.subject, c.min_delay_sec, c.max_delay_sec,
-               ct.id as contact_id, ct.first_name, ct.last_name, ct.email, ct.company_name, ct.title, ct.mx_valid, ct.is_unsubscribed
-        FROM campaign_contacts cc
-        JOIN campaigns c ON cc.campaign_id = c.id
-        JOIN contacts ct ON cc.contact_id = ct.id
-        WHERE cc.user_id = ?
-    """
-    params = [u_id]
-    if campaign_id:
-        query += " AND cc.campaign_id = ?"
-        params.append(campaign_id)
-    if status:
-        query += " AND cc.status = ?"
-        params.append(status)
+    if IS_POSTGRES:
+        query = """
+            SELECT cc.id as cc_id, cc.status as send_status, cc.scheduled_time, cc.sent_at, cc.opened_at, cc.open_count, cc.error_message,
+                   c.id as campaign_id, c.name as campaign_name, c.subject, c.min_delay_sec, c.max_delay_sec,
+                   ct.id as contact_id, ct.first_name, ct.last_name, ct.email, ct.company_name, ct.title, ct.mx_valid, ct.is_unsubscribed
+            FROM campaign_contacts cc
+            JOIN campaigns c ON cc.campaign_id = c.id
+            JOIN contacts ct ON cc.contact_id = ct.id
+            WHERE cc.user_id = %s
+        """
+        params = [u_id]
+        if campaign_id:
+            query += " AND cc.campaign_id = %s"
+            params.append(campaign_id)
+        if status:
+            query += " AND cc.status = %s"
+            params.append(status)
 
-    query += " ORDER BY cc.id DESC LIMIT 1000"
+        query += " ORDER BY cc.id DESC LIMIT 1000"
+    else:
+        query = """
+            SELECT cc.id as cc_id, cc.status as send_status, cc.scheduled_time, cc.sent_at, cc.opened_at, cc.open_count, cc.error_message,
+                   c.id as campaign_id, c.name as campaign_name, c.subject, c.min_delay_sec, c.max_delay_sec,
+                   ct.id as contact_id, ct.first_name, ct.last_name, ct.email, ct.company_name, ct.title, ct.mx_valid, ct.is_unsubscribed
+            FROM campaign_contacts cc
+            JOIN campaigns c ON cc.campaign_id = c.id
+            JOIN contacts ct ON cc.contact_id = ct.id
+            WHERE cc.user_id = ?
+        """
+        params = [u_id]
+        if campaign_id:
+            query += " AND cc.campaign_id = ?"
+            params.append(campaign_id)
+        if status:
+            query += " AND cc.status = ?"
+            params.append(status)
+
+        query += " ORDER BY cc.id DESC LIMIT 1000"
 
     cursor.execute(query, params)
     rows = [dict(r) for r in cursor.fetchall()]
@@ -498,10 +520,16 @@ def retry_failed_queue(campaign_id: Optional[int] = None, user: dict = Depends(v
     u_id = user.get("user_id", "default")
     conn = get_db()
     cursor = conn.cursor()
-    if campaign_id:
-        cursor.execute("UPDATE campaign_contacts SET status = 'pending', error_message = NULL WHERE user_id = ? AND campaign_id = ? AND status = 'failed'", (u_id, campaign_id))
+    if IS_POSTGRES:
+        if campaign_id:
+            cursor.execute("UPDATE campaign_contacts SET status = 'pending', error_message = NULL WHERE user_id = %s AND campaign_id = %s AND status = 'failed'", (u_id, campaign_id))
+        else:
+            cursor.execute("UPDATE campaign_contacts SET status = 'pending', error_message = NULL WHERE user_id = %s AND status = 'failed'", (u_id,))
     else:
-        cursor.execute("UPDATE campaign_contacts SET status = 'pending', error_message = NULL WHERE user_id = ? AND status = 'failed'", (u_id,))
+        if campaign_id:
+            cursor.execute("UPDATE campaign_contacts SET status = 'pending', error_message = NULL WHERE user_id = ? AND campaign_id = ? AND status = 'failed'", (u_id, campaign_id))
+        else:
+            cursor.execute("UPDATE campaign_contacts SET status = 'pending', error_message = NULL WHERE user_id = ? AND status = 'failed'", (u_id,))
     conn.commit()
     conn.close()
     return {"status": "retried"}
@@ -512,13 +540,19 @@ async def start_or_resume_campaign(campaign_id: int, background_tasks: Backgroun
     u_id = user.get("user_id", "default")
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM campaigns WHERE id = ? AND user_id = ?", (campaign_id, u_id))
+    if IS_POSTGRES:
+        cursor.execute("SELECT * FROM campaigns WHERE id = %s AND user_id = %s", (campaign_id, u_id))
+    else:
+        cursor.execute("SELECT * FROM campaigns WHERE id = ? AND user_id = ?", (campaign_id, u_id))
     c = cursor.fetchone()
     if not c:
         conn.close()
         raise HTTPException(status_code=404, detail="Campaign not found.")
 
-    cursor.execute("UPDATE campaigns SET status = 'sending', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (campaign_id,))
+    if IS_POSTGRES:
+        cursor.execute("UPDATE campaigns SET status = 'sending', updated_at = CURRENT_TIMESTAMP WHERE id = %s", (campaign_id,))
+    else:
+        cursor.execute("UPDATE campaigns SET status = 'sending', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (campaign_id,))
     conn.commit()
     conn.close()
 
@@ -535,7 +569,10 @@ def pause_campaign(campaign_id: int):
     worker.pause_campaign(campaign_id)
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("UPDATE campaigns SET status = 'paused', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (campaign_id,))
+    if IS_POSTGRES:
+        cursor.execute("UPDATE campaigns SET status = 'paused', updated_at = CURRENT_TIMESTAMP WHERE id = %s", (campaign_id,))
+    else:
+        cursor.execute("UPDATE campaigns SET status = 'paused', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (campaign_id,))
     conn.commit()
     conn.close()
     return {"status": "paused"}
@@ -545,7 +582,10 @@ def stop_campaign(campaign_id: int):
     worker.stop_campaign(campaign_id)
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("UPDATE campaigns SET status = 'stopped', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (campaign_id,))
+    if IS_POSTGRES:
+        cursor.execute("UPDATE campaigns SET status = 'stopped', updated_at = CURRENT_TIMESTAMP WHERE id = %s", (campaign_id,))
+    else:
+        cursor.execute("UPDATE campaigns SET status = 'stopped', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (campaign_id,))
     conn.commit()
     conn.close()
     return {"status": "stopped"}
@@ -556,9 +596,14 @@ def delete_campaign(campaign_id: int, user: dict = Depends(verify_authenticated_
     worker.stop_campaign(campaign_id)
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM campaign_contacts WHERE campaign_id = ? AND user_id = ?", (campaign_id, u_id))
-    cursor.execute("DELETE FROM campaigns WHERE id = ? AND user_id = ?", (campaign_id, u_id))
-    cursor.execute("DELETE FROM logs WHERE campaign_id = ? AND user_id = ?", (campaign_id, u_id))
+    if IS_POSTGRES:
+        cursor.execute("DELETE FROM campaign_contacts WHERE campaign_id = %s AND user_id = %s", (campaign_id, u_id))
+        cursor.execute("DELETE FROM campaigns WHERE id = %s AND user_id = %s", (campaign_id, u_id))
+        cursor.execute("DELETE FROM logs WHERE campaign_id = %s AND user_id = %s", (campaign_id, u_id))
+    else:
+        cursor.execute("DELETE FROM campaign_contacts WHERE campaign_id = ? AND user_id = ?", (campaign_id, u_id))
+        cursor.execute("DELETE FROM campaigns WHERE id = ? AND user_id = ?", (campaign_id, u_id))
+        cursor.execute("DELETE FROM logs WHERE campaign_id = ? AND user_id = ?", (campaign_id, u_id))
     conn.commit()
     conn.close()
     return {"status": "deleted"}
@@ -607,7 +652,7 @@ def get_smtp_settings(user: dict = Depends(verify_authenticated_user)):
         "smtp_host": get_setting("SMTP_HOST", "smtp.gmail.com", user_id=u_id),
         "smtp_port": int(get_setting("SMTP_PORT", "587", user_id=u_id)),
         "smtp_user": get_setting("SMTP_USER", "", user_id=u_id),
-        "smtp_pass": get_setting("SMTP_PASS", "", user_id=user_id),
+        "smtp_pass": get_setting("SMTP_PASS", "", user_id=u_id),
         "from_name": get_setting("FROM_NAME", "ColdMail Outreach", user_id=u_id),
         "from_email": get_setting("FROM_EMAIL", "", user_id=u_id),
         "app_url": get_setting("APP_URL", "http://localhost:8000", user_id=u_id)
@@ -660,7 +705,10 @@ TRANSPARENT_GIF = b'GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\
 def track_email_open(cc_id: int):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("UPDATE campaign_contacts SET open_count = open_count + 1, opened_at = CURRENT_TIMESTAMP WHERE id = ?", (cc_id,))
+    if IS_POSTGRES:
+        cursor.execute("UPDATE campaign_contacts SET open_count = open_count + 1, opened_at = CURRENT_TIMESTAMP WHERE id = %s", (cc_id,))
+    else:
+        cursor.execute("UPDATE campaign_contacts SET open_count = open_count + 1, opened_at = CURRENT_TIMESTAMP WHERE id = ?", (cc_id,))
     conn.commit()
     conn.close()
     return Response(content=TRANSPARENT_GIF, media_type="image/gif")
@@ -670,8 +718,12 @@ def track_email_open(cc_id: int):
 def unsubscribe_recipient(email: str):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO unsubscribes (email) VALUES (?)", (email,))
-    cursor.execute("UPDATE contacts SET is_unsubscribed = 1 WHERE email = ?", (email,))
+    if IS_POSTGRES:
+        cursor.execute("INSERT INTO unsubscribes (email) VALUES (%s)", (email,))
+        cursor.execute("UPDATE contacts SET is_unsubscribed = 1 WHERE email = %s", (email,))
+    else:
+        cursor.execute("INSERT OR REPLACE INTO unsubscribes (email) VALUES (?)", (email,))
+        cursor.execute("UPDATE contacts SET is_unsubscribed = 1 WHERE email = ?", (email,))
     conn.commit()
     conn.close()
 
