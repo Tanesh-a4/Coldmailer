@@ -6,7 +6,7 @@ from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Response, BackgroundTasks, Depends
 from pydantic import BaseModel
 
-from server.database import get_db, get_setting, set_setting, log_event, recalculate_queue_schedule_times
+from server.database import get_db, get_setting, set_setting, log_event, recalculate_queue_schedule_times, IS_POSTGRES
 from server.services.anti_spam import analyze_email_content, personalize_template, check_google_account_safety
 from server.services.domain_checker import check_domain_mx, audit_sender_domain
 from server.services.email_worker import worker, send_single_email
@@ -86,7 +86,7 @@ def change_password(req: ChangePasswordRequest, user: dict = Depends(verify_auth
     return {"status": "success", "message": "Admin credentials updated successfully!"}
 
 # --- 1. Health & Dashboard Analytics ---
-@router.get("/health")
+@router.api_route("/health", methods=["GET", "HEAD", "POST", "OPTIONS"])
 def health_check():
     return {"status": "ok", "service": "ColdMail Anti-Spam Engine"}
 
