@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Python / Server build artifacts & cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+venv/
+.venv/
+env/
+
+# Database & runtime files
+*.db
+*.sqlite
+*.sqlite3
+server/data/*.db
+server/data/uploads/*
+!server/data/uploads/.gitkeep
+
+# Build output
+client/dist/
+client/dist-ssr/
+
+# Logs
+*.log
+logs/
+
+# IDE / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
