@@ -1,6 +1,7 @@
 import os
 import csv
 import io
+import re
 import smtplib
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Response, BackgroundTasks, Depends
@@ -195,7 +196,7 @@ def create_contact(contact: ContactCreate, user: dict = Depends(verify_authentic
 @router.post("/contacts/upload-csv")
 async def upload_contacts_csv(file: UploadFile = File(...), user: dict = Depends(verify_authenticated_user)):
     u_id = user.get("user_id", "default")
-    if not file.filename.endswith(".csv"):
+    if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files are supported.")
 
     content = await file.read()
@@ -207,60 +208,104 @@ async def upload_contacts_csv(file: UploadFile = File(...), user: dict = Depends
 
     imported_count = 0
     skipped_count = 0
+    email_regex = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
 
     for row in reader:
-        # Find email field
-        email = row.get("Email") or row.get("email") or row.get("EMAIL")
+        # Flexible Header & Fallback Email Extraction
+        email = None
+        for k, v in row.items():
+            if k and "email" in k.lower() and v and "@" in str(v):
+                email = str(v).strip().lower()
+                break
+        
+        if not email:
+            # Cell scan fallback
+            for v in row.values():
+                if v and "@" in str(v):
+                    m = email_regex.search(str(v))
+                    if m:
+                        email = m.group(0).lower()
+                        break
+
         if not email or "@" not in email:
             skipped_count += 1
             continue
 
-        email = email.strip()
-        first_name = row.get("First Name") or row.get("first_name") or ""
-        last_name = row.get("Last Name") or row.get("last_name") or ""
-        company_name = row.get("Company Name") or row.get("company_name") or ""
-        title = row.get("Title") or row.get("title") or ""
-        phone = row.get("Phone") or row.get("phone") or ""
-        stage = row.get("Stage") or row.get("stage") or ""
-        linkedin_url = row.get("Person Linkedin Url") or row.get("linkedin_url") or ""
+        # Helper to extract metadata by candidate header names
+        def get_val(keys: list) -> str:
+            for key in keys:
+                for rk, rv in row.items():
+                    if rk and key in rk.lower() and rv:
+                        return str(rv).strip()
+            return ""
 
-        # MX Check
-        mx_res = check_domain_mx(email)
-        mx_valid = 1 if mx_res.get("valid") else 0
+        first_name = get_val(["first name", "firstname", "first_name", "fname"])
+        last_name = get_val(["last name", "lastname", "last_name", "lname"])
+        
+        # If first_name is empty but row has a Name column, split full name
+        if not first_name:
+            full_name = get_val(["name", "full name", "fullname"])
+            if full_name:
+                parts = full_name.split(" ", 1)
+                first_name = parts[0]
+                if len(parts) > 1 and not last_name:
+                    last_name = parts[1]
+
+        company_name = get_val(["company name", "company", "organization", "corp"])
+        title = get_val(["title", "position", "role", "designation"])
+        phone = get_val(["phone", "mobile", "contact"])
+        stage = get_val(["stage", "status", "lead stage"])
+        linkedin_url = get_val(["person linkedin url", "linkedin", "linkedin_url"])
 
         try:
+            # Check existing contact for MDM deduplication
             if IS_POSTGRES:
-                cursor.execute("""
-                    INSERT INTO contacts (user_id, first_name, last_name, email, company_name, title, phone, stage, linkedin_url, mx_valid)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT(email) DO UPDATE SET
-                        first_name=EXCLUDED.first_name,
-                        last_name=EXCLUDED.last_name,
-                        company_name=EXCLUDED.company_name,
-                        title=EXCLUDED.title,
-                        phone=EXCLUDED.phone,
-                        stage=EXCLUDED.stage,
-                        linkedin_url=EXCLUDED.linkedin_url,
-                        mx_valid=EXCLUDED.mx_valid
-                """, (u_id, first_name.strip(), last_name.strip(), email, company_name.strip(),
-                      title.strip(), phone.strip(), stage.strip(), linkedin_url.strip(), mx_valid))
+                cursor.execute("SELECT id FROM contacts WHERE user_id = %s AND email = %s", (u_id, email))
             else:
-                cursor.execute("""
-                    INSERT INTO contacts (user_id, first_name, last_name, email, company_name, title, phone, stage, linkedin_url, mx_valid)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(email) DO UPDATE SET
-                        first_name=excluded.first_name,
-                        last_name=excluded.last_name,
-                        company_name=excluded.company_name,
-                        title=excluded.title,
-                        phone=excluded.phone,
-                        stage=excluded.stage,
-                        linkedin_url=excluded.linkedin_url,
-                        mx_valid=excluded.mx_valid
-                """, (u_id, first_name.strip(), last_name.strip(), email, company_name.strip(),
-                      title.strip(), phone.strip(), stage.strip(), linkedin_url.strip(), mx_valid))
+                cursor.execute("SELECT id FROM contacts WHERE user_id = ? AND email = ?", (u_id, email))
+            
+            existing = cursor.fetchone()
+
+            if existing:
+                c_id = existing[0] if not isinstance(existing, dict) else existing["id"]
+                if IS_POSTGRES:
+                    cursor.execute("""
+                        UPDATE contacts 
+                        SET first_name = COALESCE(NULLIF(%s, ''), first_name),
+                            last_name = COALESCE(NULLIF(%s, ''), last_name),
+                            company_name = COALESCE(NULLIF(%s, ''), company_name),
+                            title = COALESCE(NULLIF(%s, ''), title),
+                            phone = COALESCE(NULLIF(%s, ''), phone),
+                            stage = COALESCE(NULLIF(%s, ''), stage),
+                            linkedin_url = COALESCE(NULLIF(%s, ''), linkedin_url)
+                        WHERE id = %s
+                    """, (first_name, last_name, company_name, title, phone, stage, linkedin_url, c_id))
+                else:
+                    cursor.execute("""
+                        UPDATE contacts 
+                        SET first_name = CASE WHEN ? != '' THEN ? ELSE first_name END,
+                            last_name = CASE WHEN ? != '' THEN ? ELSE last_name END,
+                            company_name = CASE WHEN ? != '' THEN ? ELSE company_name END,
+                            title = CASE WHEN ? != '' THEN ? ELSE title END,
+                            phone = CASE WHEN ? != '' THEN ? ELSE phone END,
+                            stage = CASE WHEN ? != '' THEN ? ELSE stage END,
+                            linkedin_url = CASE WHEN ? != '' THEN ? ELSE linkedin_url END
+                        WHERE id = ?
+                    """, (first_name, first_name, last_name, last_name, company_name, company_name, title, title, phone, phone, stage, stage, linkedin_url, linkedin_url, c_id))
+            else:
+                if IS_POSTGRES:
+                    cursor.execute("""
+                        INSERT INTO contacts (user_id, first_name, last_name, email, company_name, title, phone, stage, linkedin_url, mx_valid)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1)
+                    """, (u_id, first_name, last_name, email, company_name, title, phone, stage, linkedin_url))
+                else:
+                    cursor.execute("""
+                        INSERT INTO contacts (user_id, first_name, last_name, email, company_name, title, phone, stage, linkedin_url, mx_valid)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    """, (u_id, first_name, last_name, email, company_name, title, phone, stage, linkedin_url))
+            
             imported_count += 1
-        except Exception:
+        except Exception as e:
             skipped_count += 1
 
     conn.commit()
